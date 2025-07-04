@@ -3,9 +3,9 @@ import perceval as pcvl
 import numpy as np
 
 from .utils import generate_all_fock_states
-from ..sampling.autodiff import AutoDiffProcess
 from ..pcvl_pytorch.locirc_to_tensor import CircuitConverter
 from ..pcvl_pytorch.slos_torchscript import build_slos_distribution_computegraph as build_slos_graph
+from .noise import PartialDistinguishabilitySLOS
 
 from typing import Union
 from torch import Tensor
@@ -153,6 +153,7 @@ class FidelityKernel(torch.nn.Module):
         'binomial' or 'gaussian'.
     :param no_bunching: Whether or not to post-select out results with 
         bunching.
+    :param indistingushability:
     :param force_psd: Projects training kernel matrix to closest 
     positive semi-definite. Default: `True`.
     :param device: Device on which to perform SLOS
@@ -191,6 +192,7 @@ class FidelityKernel(torch.nn.Module):
         input_state: list,
         *,
         shots: int = None,
+        indistinguishability: float = None,
         sampling_method: str = 'multinomial',
         no_bunching=True,
         force_psd=True,
@@ -201,6 +203,7 @@ class FidelityKernel(torch.nn.Module):
         self.feature_map = feature_map
         self.input_state = input_state
         self.shots = shots or 0
+        self.indistinguishability = indistinguishability
         self.sampling_method = sampling_method
         self.no_bunching = no_bunching
         self.force_psd = force_psd
@@ -227,20 +230,20 @@ class FidelityKernel(torch.nn.Module):
 
         m, n = len(input_state), sum(input_state)
 
-        self._slos_graph = build_slos_graph(
-            m=m,
-            n_photons=n,
-            no_bunching=no_bunching,
-            keep_keys=False,
-            device=device,
-            dtype=self.dtype
-        )
+        if indistinguishability:
+            self._slos_graph = PartialDistinguishabilitySLOS(input_state, indistinguishability)
+        else:
+            self._slos_graph = build_slos_graph(
+                m=m,
+                n_photons=n,
+                no_bunching=no_bunching,
+                keep_keys=False,
+                device=device,
+                dtype=self.dtype
+            )
         # Find index of input state in output distribution
         all_fock_states = list(generate_all_fock_states(m, n, no_bunching=no_bunching))
         self._input_state_index = all_fock_states.index(tuple(input_state))
-
-        # For sampling
-        self._autodiff_process = AutoDiffProcess()
 
 
     def forward(self, x1: Union[float, np.ndarray, Tensor], x2=None):
@@ -284,7 +287,7 @@ class FidelityKernel(torch.nn.Module):
                 for x in x2])
             
             # Calculate circuit unitary for every pair of datapoints
-            all_circuits = U_forward.unsqueeze(1) @ U_adjoint.unsqueeze(0)
+            all_circuits = U_adjoint.unsqueeze(1) @ U_forward.unsqueeze(0)
             all_circuits = all_circuits.view(-1, *all_circuits.shape[2:])
         else:
             U_adjoint = U_forward.conj().transpose(1, 2)
@@ -293,13 +296,16 @@ class FidelityKernel(torch.nn.Module):
             upper_idx = torch.triu_indices(
                 len_x1, len_x1,
                 offset=1,
-                dtype=self.feature_map.dtype,
+                dtype=torch.int32,
                 device=self.feature_map.device,
             )
-            all_circuits = U_forward[upper_idx[0]] @ U_adjoint[upper_idx[1]]
+            all_circuits = U_adjoint[upper_idx[0]] @ U_forward[upper_idx[1]]
 
         # Distribution for every evaluated circuit
-        all_probs = self._slos_graph.compute(
+        if self.indistinguishability:
+            all_probs = self._slos_graph.compute(all_circuits)[1]
+        else:
+            all_probs = self._slos_graph.compute(
             all_circuits, self.input_state)[1]
 
         if self.shots > 0:
@@ -323,7 +329,8 @@ class FidelityKernel(torch.nn.Module):
                 kernel_matrix = self._project_psd(kernel_matrix)
 
         else:
-            kernel_matrix = transition_probs.reshape(len_x1, len(x2))
+            print(transition_probs)
+            kernel_matrix = transition_probs.view(len(x2), len_x1).T
 
             if self.force_psd and equal_inputs:
                 # Symmetrize the matrix
@@ -345,24 +352,32 @@ class FidelityKernel(torch.nn.Module):
         U = self.feature_map.compute_unitary(x1)
         U_adjoint = self.feature_map.compute_unitary(x2)
         U_adjoint = U_adjoint.conj().transpose(0, 1)
+        
 
-        probs = self._slos_graph.compute(U @ U_adjoint, self.input_state)[1]
+        if self.indistinguishability:
+            _, probs = self._slos_graph.compute(U_adjoint @ U)
+        else:
+            _, probs = self._slos_graph.compute(U_adjoint @ U, self.input_state)
 
         if self.shots > 0:
             probs = self._autodiff_process.sampling_noise.pcvl_sampler(
                 probs, self.shots, self.sampling_method
             )
-        return probs[self._input_state_index].item()
+            
+        if probs.ndim != 1:
+            res = probs[0][self._input_state_index]
+        else:
+            res = probs[self._input_state_index]
+        return res.item()
 
     @staticmethod
     def _project_psd(matrix: Tensor) -> Tensor:
         """Projects a symmetric matrix to closest positive semi-definite"""
         # Perform spectral decomposition and set negative eigenvalues to 0
         eigenvals, eigenvecs = torch.linalg.eigh(matrix)
-        eigenvals = torch.diag(torch.where(eigenvals > 0, eigenvals, 0))
+        eigenvals = torch.diag(torch.clamp(eigenvals, min=0))
 
         matrix_psd = eigenvecs @ eigenvals @ eigenvecs.transpose(0, 1)
-        matrix_psd.fill_diagonal_(1)
         
         return matrix_psd
     
