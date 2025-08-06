@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import perceval as pcvl
 
-from ..core.quantum_kernels import FeatureMap, FidelityKernel
+from ..merlin.core.quantum_kernels import FeatureMap, FidelityKernel
 
 @pytest.mark.parametrize("x1, x2", [
     (torch.tensor([0.5]), torch.tensor([0.5])),

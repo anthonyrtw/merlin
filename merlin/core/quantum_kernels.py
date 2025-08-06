@@ -194,7 +194,7 @@ class FidelityKernel(torch.nn.Module):
         shots: int = None,
         indistinguishability: float = None,
         sampling_method: str = 'multinomial',
-        no_bunching=True,
+        pnr = None,
         force_psd=True,
         device=None,
         dtype=None
@@ -205,7 +205,7 @@ class FidelityKernel(torch.nn.Module):
         self.shots = shots or 0
         self.indistinguishability = indistinguishability
         self.sampling_method = sampling_method
-        self.no_bunching = no_bunching
+        self.pnr = sum(input_state) if pnr is None else pnr
         self.force_psd = force_psd
         self.device = device or feature_map.device
         self.dtype = dtype or feature_map.dtype
@@ -219,31 +219,42 @@ class FidelityKernel(torch.nn.Module):
             for param_name, param in feature_map._training_dict.items():
                 self.register_parameter(param_name, param)
 
-        if max(input_state) > 1 and no_bunching:
+        if max(input_state) > 1 and pnr == 1:
             raise ValueError(
                 f"Bunching must be enabled for an input state with"
                 f"{max(input_state)} in one mode.")
-        elif all(x == 1 for x in input_state) and no_bunching:
+        elif all(x == 1 for x in input_state) and pnr == 1:
             raise ValueError(
-                "For `no_bunching = True`, the kernel value will always be 1"
+                "For `pnr = 1`, the kernel value will always be 1"
                 " for an input state with a photon in all modes.")
 
         m, n = len(input_state), sum(input_state)
-
+        
+        all_fock_states = list(generate_all_fock_states(m, n))
+        self._input_state_index = all_fock_states.index(tuple(input_state))
+        
+        if pnr is not None and pnr != sum(input_state):
+            def output_map_func(state):
+                return tuple(min(i, pnr) for i in state)
+            
+            self._number_conserving_idx = torch.tensor([
+                i for i, state in enumerate(all_fock_states)
+                if sum(output_map_func(state)) == sum(input_state)
+            ])
+        else:
+            output_map_func = None
+            
         if indistinguishability:
             self._slos_graph = PartialDistinguishabilitySLOS(input_state, indistinguishability)
         else:
             self._slos_graph = build_slos_graph(
                 m=m,
                 n_photons=n,
-                no_bunching=no_bunching,
-                keep_keys=False,
+                output_map_func=output_map_func,
+                keep_keys=True,
                 device=device,
                 dtype=self.dtype
             )
-        # Find index of input state in output distribution
-        all_fock_states = list(generate_all_fock_states(m, n, no_bunching=no_bunching))
-        self._input_state_index = all_fock_states.index(tuple(input_state))
 
 
     def forward(self, x1: Union[float, np.ndarray, Tensor], x2=None):
@@ -300,21 +311,28 @@ class FidelityKernel(torch.nn.Module):
                 device=self.feature_map.device,
             )
             all_circuits = U_adjoint[upper_idx[0]] @ U_forward[upper_idx[1]]
-
+            
         # Distribution for every evaluated circuit
         if self.indistinguishability:
-            all_probs = self._slos_graph.compute(all_circuits)[1]
+            results = self._slos_graph.compute(all_circuits)
+            keys, all_probs = results
         else:
-            all_probs = self._slos_graph.compute(
-            all_circuits, self.input_state)[1]
-
+            results = self._slos_graph.compute(all_circuits, self.input_state)
+            keys, all_probs = results
+        
         if self.shots > 0:
             all_probs = self._autodiff_process.sampling_noise.pcvl_sampler(
                 all_probs, self.shots, self.sampling_method
             )
-
-        transition_probs = all_probs[:, self._input_state_index]
-
+            
+        if self.pnr != sum(self.input_state):
+            norms = all_probs[:, self._number_conserving_idx].sum(dim=1)
+        else:
+            self._input_state_index = keys.index(tuple(self.input_state))
+            norms = torch.ones(len(all_circuits))
+        
+        transition_probs = all_probs[:, self._input_state_index] / norms
+        
         if x2 is None:
             # Copy transition probs to upper & lower diagonal
             kernel_matrix = torch.zeros(
@@ -324,22 +342,21 @@ class FidelityKernel(torch.nn.Module):
             kernel_matrix[upper_idx[0], upper_idx[1]] = transition_probs
             kernel_matrix[upper_idx[1], upper_idx[0]] = transition_probs
             kernel_matrix.fill_diagonal_(1)
-
+        
             if self.force_psd:
                 kernel_matrix = self._project_psd(kernel_matrix)
-
+        
         else:
-            print(transition_probs)
             kernel_matrix = transition_probs.view(len(x2), len_x1).T
-
+        
             if self.force_psd and equal_inputs:
                 # Symmetrize the matrix
                 kernel_matrix = 0.5 * (kernel_matrix + kernel_matrix.transpose(0, 1))
                 kernel_matrix = self._project_psd(kernel_matrix)
-
+        
         if isinstance(x1, np.ndarray):
             kernel_matrix = kernel_matrix.detach().numpy()
-
+        
         return kernel_matrix
 
     def _return_kernel_scalar(self, x1, x2):

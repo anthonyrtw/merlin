@@ -4,7 +4,7 @@ from itertools import combinations, chain
 import torch 
 from functools import reduce
 
-def generate_all_fock_states(m, n, no_bunching = False, loss = False) -> Generator:
+def generate_all_fock_states(m, n, pnr = None, loss = False) -> Generator:
     """
     Generates all possible Fock states for m modes and n photons.
     
@@ -18,19 +18,31 @@ def generate_all_fock_states(m, n, no_bunching = False, loss = False) -> Generat
     if loss:
         # Combine all generate_all_fock_states from n to 0.
         yield from chain.from_iterable(
-            generate_all_fock_states(m, n_, no_bunching=no_bunching, loss=False) 
+            generate_all_fock_states(m, n_, pnr=pnr, loss=False) 
             for n_ in reversed(range(n + 1)))
         return
     
-    if no_bunching:
-        if n > m or n < 0:
+    if pnr is not None and pnr < n:
+        def _backtrack(mode_idx, remaining_n, current_distribution):
+            # Base case: filled all modes
+            if mode_idx == m:
+                if remaining_n == 0:
+                    yield tuple(current_distribution)
+                return
+            
+            # Try all possible photon counts for current mode
+            max_n = min(remaining_n, pnr)
+            for n_in_mode in range(max_n + 1):
+                current_distribution[mode_idx] = n_in_mode
+                yield from _backtrack(
+                    mode_idx + 1,
+                    remaining_n - n_in_mode, 
+                    current_distribution)
+        
+        if n > m * pnr:
             return
-        for positions in combinations(range(m), n):
-            fock_state = [0] * m
-
-            for pos in positions:
-                fock_state[pos] = 1
-            yield tuple(fock_state)
+        
+        yield from _backtrack(0, n, [0] * m)
 
     else:
         if n == 0:
@@ -43,7 +55,6 @@ def generate_all_fock_states(m, n, no_bunching = False, loss = False) -> Generat
         for i in reversed(range(n + 1)):
             for state in generate_all_fock_states(m-1, n-i):
                 yield (i,) + state
-
 
 def prob_distribution_tensor_product(
     keys: Union[list[torch.Tensor]],

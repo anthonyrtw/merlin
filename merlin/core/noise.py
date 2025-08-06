@@ -11,8 +11,6 @@ from ..pcvl_pytorch import build_slos_distribution_computegraph as build_slos_gr
 class PartialDistinguishabilitySLOS:
     """ 
     Equivalent to SLOSGraph but with partial distinguishability.
-    
-    
     """
     def __init__(self, input_state: list, indistinguishability):
         self.input_state = input_state 
@@ -21,9 +19,7 @@ class PartialDistinguishabilitySLOS:
         if max(input_state) > 1:
             raise NotImplementedError(
                 'States with multiple photons per mode not supported yet.')
-        
-        #self._partial_input_states = self._generate_all_partial_states()
-        
+                
         m, self.n = len(input_state), sum(input_state)
         self._slos_graphs = [build_slos_graph(m, n_i) 
                             for n_i in range(1, self.n + 1)]
@@ -119,7 +115,6 @@ class PartialDistinguishabilitySLOS:
         if n_bad == 0:
             return bad_bits.unsqueeze(0)
         
-        # Create result tensor
         result = torch.zeros(n_bad + 1, n, dtype=bad_bits.dtype, device=bad_bits.device)
         
         # Use advanced indexing to set bad bits efficiently
@@ -158,23 +153,5 @@ class PartialDistinguishabilitySLOS:
         result[:, good_indices] = combinations
         
         return result
-    
-    # def _generate_all_partial_states(self):
-    #     """Generate all partial states for a given input state."""
-    #     input_state = self.input_state
-    #     if not isinstance(input_state, torch.Tensor):
-    #         input_state = torch.tensor(input_state)
-            
-    #     idx = torch.nonzero(input_state).flatten()
-    #     n = idx.numel()
-    #     combinations = torch.stack(
-    #         torch.meshgrid(*[torch.tensor([0, 1])] * n, indexing='ij'), dim=-1)
-    #     combinations = combinations.reshape(-1, n).flip(0).to(torch.int)
-        
-    #     result = torch.zeros((combinations.size(0), input_state.size(0)), 
-    #                         dtype=torch.int)
-    #     result[:, idx] = combinations
-        
-    #     return result[:-1]
 
 
