@@ -45,6 +45,23 @@ def test_ps_to_torch():
     assert expected_grad == params["x"].grad
 
 
+def test_ps_expression_to_torch_preserves_gradient():
+    x = Parameter("x")
+    c_ps = Circuit(1) // PS(2 * x + 1)
+    param = torch.tensor([0.1], requires_grad=True)
+
+    torch_conv = CircuitConverter(c_ps, input_specs=["x"])
+    torch_tensor = torch_conv.to_tensor(param)
+
+    phase = 2 * param.detach() + 1
+    expected = torch.complex(torch.cos(phase), torch.sin(phase)).reshape(1, 1)
+    assert torch.allclose(torch_tensor, expected, atol=1e-6)
+
+    torch_tensor.real.sum().backward()
+    expected_grad = -2 * torch.sin(phase)
+    assert torch.allclose(param.grad, expected_grad, atol=1e-6)
+
+
 @pytest.mark.parametrize("circuit_size", [2, 3, 5])
 def test_2ps_circ_to_torch(circuit_size):
     c_ps = Circuit(circuit_size) // PS(Parameter("x")) // (1, PS(Parameter("y")))
@@ -140,6 +157,30 @@ def test_bs_to_torch(bs_type):
     exptd_u = torch.tensor(c_bs.compute_unitary(), dtype=torch.complex64)
 
     torch.allclose(torch_tensor, exptd_u)
+
+
+def test_bs_expression_to_torch_matches_perceval():
+    theta = Parameter("theta")
+    phi = Parameter("phi")
+    c_bs = Circuit(2) // BS.Rx(theta=2 * theta + 1, phi_tl=theta + phi)
+    params = {
+        "theta": torch.tensor([0.3], requires_grad=True),
+        "phi": torch.tensor([0.2], requires_grad=True),
+    }
+
+    torch_conv = CircuitConverter(c_bs, input_specs=["theta", "phi"])
+    torch_tensor = torch_conv.to_tensor(params["theta"], params["phi"])
+
+    for each_param in c_bs.get_parameters():
+        each_param.set_value(params[each_param.name].detach().item())
+    expected = torch.tensor(c_bs.compute_unitary(), dtype=torch.complex64)
+    assert torch.allclose(torch_tensor, expected, atol=1e-6)
+
+    torch_tensor.real.sum().backward()
+    assert params["theta"].grad is not None
+    assert params["phi"].grad is not None
+    assert torch.isfinite(params["theta"].grad).all()
+    assert torch.isfinite(params["phi"].grad).all()
 
 
 @pytest.mark.parametrize(

@@ -117,7 +117,7 @@ class StageRuntime:
     initial_amplitudes : torch.Tensor | None
         Initial amplitudes for amplitude-encoding execution.
     classical_input_size : int
-        Number of classical inputs consumed by the stage. Default is ``0``.
+        Number of classical inputs consumed by the pre-measurement stage. Default is ``0``.
     """
 
     circuit: pcvl.Circuit
@@ -282,6 +282,7 @@ class FeedForwardBlock(MerlinModule):
             trainable_parameters=trainable_parameters,
             input_parameters=input_parameters,
         )
+        self._initialize_shared_trainable_parameters()
 
         for idx, stage in enumerate(self.stages):
             runtime = self._build_stage_runtime(
@@ -303,6 +304,59 @@ class FeedForwardBlock(MerlinModule):
         name = f"{prefix}_{self._layer_registry_counter}"
         self._layer_registry_counter += 1
         self.add_module(name, layer)
+
+    def _initialize_shared_trainable_parameters(self) -> None:
+        self._shared_trainable_parameters: dict[str, torch.nn.Parameter] = {}
+        for prefix in self._trainable_parameter_prefixes:
+            names = self._prefix_to_params_mapping.get(prefix, [])
+            if not names:
+                continue
+            parameter = torch.nn.Parameter(
+                torch.randn((len(names),), dtype=self.dtype, device=self.device)
+                * torch.pi
+            )
+            self.register_parameter(prefix, parameter)
+            self._shared_trainable_parameters[prefix] = parameter
+
+    def _trainable_prefixes_for_params(self, params: Sequence[str]) -> list[str]:
+        present = {
+            self._trainable_params_to_prefix_mapping[param]
+            for param in params
+            if param in self._trainable_params_to_prefix_mapping
+        }
+        return [
+            prefix for prefix in self._trainable_parameter_prefixes if prefix in present
+        ]
+
+    def _bind_shared_trainable_parameters(
+        self, layer: QuantumLayer, prefixes: Sequence[str]
+    ) -> None:
+        if not prefixes:
+            return
+
+        converter = layer.computation_process.converter
+        spec_mappings = converter.spec_mappings
+        shared_thetas = []
+        theta_names = []
+
+        for tensor_id, prefix in enumerate(prefixes):
+            local_names = spec_mappings.get(prefix, [])
+            if not local_names:
+                continue
+
+            global_parameter = self._shared_trainable_parameters[prefix]
+            global_indices = self._trainable_prefix_param_indices[prefix]
+            shared_thetas.append(global_parameter)
+            theta_names.extend(local_names)
+
+            for name in local_names:
+                converter.param_mapping[name] = (tensor_id, global_indices[name])
+
+            if prefix in layer._parameters:
+                del layer._parameters[prefix]
+
+        layer.thetas = shared_thetas
+        layer.theta_names = theta_names
 
     def _resolve_input_state_from_experiment(
         self,
@@ -593,6 +647,11 @@ class FeedForwardBlock(MerlinModule):
         self._prefix_to_params_mapping = {}
         self._trainable_params_to_prefix_mapping = {}
         self._input_params_to_prefix_mapping = {}
+        self._trainable_parameter_prefixes = list(trainable_parameters or [])
+        self._trainable_prefix_param_indices: dict[str, dict[str, int]] = {}
+        self._input_parameter_prefixes = list(input_parameters or [])
+        self._input_prefix_feature_slices: dict[str, slice] = {}
+        self._input_feature_size = 0
 
         assigned_params: dict[str, str] = {}
         total_matching_params = set()
@@ -652,6 +711,19 @@ class FeedForwardBlock(MerlinModule):
                 "trainable or input spec"
             )
 
+        for prefix in self._trainable_parameter_prefixes:
+            self._trainable_prefix_param_indices[prefix] = {
+                name: idx
+                for idx, name in enumerate(self._prefix_to_params_mapping.get(prefix, []))
+            }
+
+        offset = 0
+        for prefix in self._input_parameter_prefixes:
+            width = len(self._prefix_to_params_mapping.get(prefix, []))
+            self._input_prefix_feature_slices[prefix] = slice(offset, offset + width)
+            offset += width
+        self._input_feature_size = offset
+
     def _build_stage_runtime(
         self,
         stage: FFStage,
@@ -682,37 +754,26 @@ class FeedForwardBlock(MerlinModule):
                     "Amplitude-encoded input states cannot be combined with classical input parameters."
                 )
 
-            input_params_set = set()
-            trainable_params_set = set()
-            for param in stage.unitary.params:
-                if param in self._input_params_to_prefix_mapping:
-                    input_params_set.add(self._input_params_to_prefix_mapping[param])
-                else:
-                    trainable_params_set.add(
-                        self._trainable_params_to_prefix_mapping[param]
-                    )
-
-            if not input_params_set == set(
-                self._input_params_to_prefix_mapping.values()
-            ):
-                raise ValueError(
-                    "The first stage must use all of the input parameters. Create you own stages with variable "
-                    "input parameters with the partial measurement strategy instead"
-                )
+            input_prefixes = self._input_prefixes_for_params(stage.unitary.params)
+            trainable_prefixes = self._trainable_prefixes_for_params(
+                stage.unitary.params
+            )
+            trainable_params_set = set(trainable_prefixes)
 
             pre_layer = QuantumLayer(
                 input_size=None if (amplitude_encoding or input_parameters) else 0,
                 circuit=stage.unitary,
                 input_state=base_input_state,
                 n_photons=self.n_photons,
-                trainable_parameters=list(trainable_params_set),
-                input_parameters=list(input_params_set),
+                trainable_parameters=trainable_prefixes,
+                input_parameters=input_prefixes,
                 measurement_strategy=MeasurementStrategy.amplitudes(
                     self.computation_space
                 ),
                 device=self.device,
                 dtype=self.dtype,
             )
+            self._bind_shared_trainable_parameters(pre_layer, trainable_prefixes)
             detector_transform = self._build_partial_detector(
                 pre_layer,
                 stage_detectors=stage.detectors,
@@ -725,15 +786,13 @@ class FeedForwardBlock(MerlinModule):
             detector_transform = None
             initial_amplitudes = None
 
-            trainable_params_set = set()
-            for param in stage.unitary.params:
-                if param in self._trainable_params_to_prefix_mapping:
-                    trainable_params_set.add(
-                        self._trainable_params_to_prefix_mapping[param]
-                    )
+            trainable_prefixes = self._trainable_prefixes_for_params(
+                stage.unitary.params
+            )
+            trainable_params_set = set(trainable_prefixes)
 
             pre_layers = self._initialize_amplitude_pre_layers(
-                stage, list(trainable_params_set)
+                stage, trainable_prefixes
             )
 
         (
@@ -747,6 +806,12 @@ class FeedForwardBlock(MerlinModule):
                 if param in self._trainable_params_to_prefix_mapping:
                     trainable_params_set.add(
                         self._trainable_params_to_prefix_mapping[param]
+                    )
+                elif param in self._input_params_to_prefix_mapping:
+                    continue
+                else:
+                    raise ValueError(
+                        f"Parameter '{param}' is not covered by any trainable or input spec"
                     )
 
         classical_input_size = (
@@ -783,6 +848,7 @@ class FeedForwardBlock(MerlinModule):
             layer = QuantumLayer(
                 input_size=None,
                 circuit=stage.unitary.copy(),
+                input_state=self._dummy_fock_input_state(stage.unitary.m, remaining),
                 n_photons=remaining,
                 measurement_strategy=MeasurementStrategy.amplitudes(
                     self.computation_space
@@ -790,6 +856,9 @@ class FeedForwardBlock(MerlinModule):
                 device=self.device,
                 dtype=self.dtype,
                 trainable_parameters=trainable_parameters,
+            )
+            self._bind_shared_trainable_parameters(
+                layer, trainable_parameters or []
             )
             self._register_layer(
                 f"stage{len(self._stage_runtimes)}_amp_{remaining}",
@@ -845,6 +914,34 @@ class FeedForwardBlock(MerlinModule):
             )
         return configurations, default_state
 
+    def _input_prefixes_for_params(self, params: Sequence[str]) -> list[str]:
+        present = {
+            self._input_params_to_prefix_mapping[param]
+            for param in params
+            if param in self._input_params_to_prefix_mapping
+        }
+        return [
+            prefix for prefix in self._input_parameter_prefixes if prefix in present
+        ]
+
+    def _classical_features_for_prefixes(
+        self, x: torch.Tensor, prefixes: Sequence[str]
+    ) -> torch.Tensor | None:
+        if not prefixes:
+            return None
+        chunks = []
+        for prefix in prefixes:
+            feature_slice = self._input_prefix_feature_slices[prefix]
+            chunks.append(x[..., feature_slice])
+        if len(chunks) == 1:
+            return chunks[0]
+        return torch.cat(chunks, dim=-1)
+
+    def _dummy_fock_input_state(self, n_modes: int, n_photons: int) -> list[int]:
+        if n_modes <= 0:
+            return []
+        return [n_photons] + [0] * (n_modes - 1)
+
     def _prepare_classical_features(self, x: torch.Tensor | None) -> torch.Tensor:
         """Normalize and validate the classical input tensor expected by the first stage.
 
@@ -865,8 +962,7 @@ class FeedForwardBlock(MerlinModule):
             If the provided tensor shape is incompatible with the experiment's
             classical input configuration.
         """
-        runtime = self._stage_runtimes[0]
-        classical_size = int(runtime.classical_input_size or 0)
+        classical_size = int(self._input_feature_size)
 
         def _ensure_tensor(tensor: torch.Tensor) -> torch.Tensor:
             if tensor.ndim == 1:
@@ -940,7 +1036,7 @@ class FeedForwardBlock(MerlinModule):
         branches = self._run_stage(self._stage_runtimes[0], feature_tensor)
 
         for runtime in self._stage_runtimes[1:]:
-            branches = self._propagate_future_stage(branches, runtime)
+            branches = self._propagate_future_stage(branches, runtime, feature_tensor)
 
         return self._branches_to_outputs(branches)
 
@@ -1053,6 +1149,7 @@ class FeedForwardBlock(MerlinModule):
                         branch_amplitudes,
                         remaining_n,
                         detector,
+                        x,
                     )
                     branch = BranchState(
                         amplitudes=conditional_output,
@@ -1068,6 +1165,7 @@ class FeedForwardBlock(MerlinModule):
         self,
         current_branches: dict[tuple[int, ...], list[BranchState]],
         runtime: StageRuntime,
+        x: torch.Tensor,
     ) -> dict[tuple[int, ...], list[BranchState]]:
         if not current_branches:
             return {}
@@ -1103,6 +1201,7 @@ class FeedForwardBlock(MerlinModule):
                             stage_output,
                             0,
                             detector,
+                            x,
                         )
                         new_branch = BranchState(
                             amplitudes=conditional_output,
@@ -1148,6 +1247,7 @@ class FeedForwardBlock(MerlinModule):
                                         branch_amplitudes,
                                         remaining_n,
                                         detector,
+                                        x,
                                     )
                                 )
                                 parent_weight = torch.nan_to_num(branch.weight, nan=0.0)
@@ -1184,13 +1284,11 @@ class FeedForwardBlock(MerlinModule):
             raise ValueError("Remaining photon count cannot be negative.")
         layer = runtime.pre_layers.get(remaining_n)
         if layer is None:
-            trainable_params_set = set()
+            trainable_prefixes = self._trainable_prefixes_for_params(
+                runtime.circuit.params
+            )
             for param in runtime.circuit.params:
-                if param in self._trainable_params_to_prefix_mapping:
-                    trainable_params_set.add(
-                        self._trainable_params_to_prefix_mapping[param]
-                    )
-                else:
+                if param not in self._trainable_params_to_prefix_mapping:
                     raise ValueError(
                         "Stages that are not the initial one can not have input parameters. Create your"
                         "own QuantumLayers for each stages with the partial measurement measurement strategy."
@@ -1198,14 +1296,18 @@ class FeedForwardBlock(MerlinModule):
             layer = QuantumLayer(
                 input_size=None,
                 circuit=runtime.circuit.copy(),
+                input_state=self._dummy_fock_input_state(
+                    runtime.circuit.m, remaining_n
+                ),
                 n_photons=remaining_n,
                 measurement_strategy=MeasurementStrategy.amplitudes(
                     self.computation_space
                 ),
                 device=self.device,
                 dtype=self.dtype,
-                trainable_parameters=list(trainable_params_set),
+                trainable_parameters=trainable_prefixes,
             )
+            self._bind_shared_trainable_parameters(layer, trainable_prefixes)
             runtime.pre_layers[remaining_n] = layer
             self._register_layer(
                 f"stage_amp_{id(runtime)}_{remaining_n}",
@@ -1294,28 +1396,31 @@ class FeedForwardBlock(MerlinModule):
         layer = runtime.conditional_layer_cache.get(cache_key)
         if layer is None:
             circuit = circuits[actual_key]
-            trainable_params_set = set()
+            trainable_prefixes = self._trainable_prefixes_for_params(circuit.params)
+            input_prefixes = self._input_prefixes_for_params(circuit.params)
             for param in circuit.params:
-                if param in self._trainable_params_to_prefix_mapping:
-                    trainable_params_set.add(
-                        self._trainable_params_to_prefix_mapping[param]
-                    )
-                else:
-                    raise ValueError(
-                        "Stages that are not the initial one can not have input parameters. Create your"
-                        "own QuantumLayers for each stages with the partial measurement measurement strategy."
-                    )
+                if (
+                    param in self._trainable_params_to_prefix_mapping
+                    or param in self._input_params_to_prefix_mapping
+                ):
+                    continue
+                raise ValueError(
+                    f"Parameter '{param}' is not covered by any trainable or input spec"
+                )
             layer = QuantumLayer(
                 input_size=None,
                 circuit=circuit.copy(),
+                input_state=self._dummy_fock_input_state(circuit.m, remaining_n),
                 n_photons=remaining_n,
                 measurement_strategy=MeasurementStrategy.amplitudes(
                     self.computation_space
                 ),
                 device=self.device,
                 dtype=self.dtype,
-                trainable_parameters=list(trainable_params_set),
+                trainable_parameters=trainable_prefixes,
+                input_parameters=input_prefixes,
             )
+            self._bind_shared_trainable_parameters(layer, trainable_prefixes)
             runtime.conditional_layer_cache[cache_key] = layer
             self._register_layer(
                 f"stage_cond_{id(runtime)}_{hash(actual_key)}_{remaining_n}",
@@ -1330,6 +1435,7 @@ class FeedForwardBlock(MerlinModule):
         branch_amplitudes: torch.Tensor,
         remaining_n: int,
         detector: DetectorTransform | None,
+        x: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[tuple[int, ...], ...]]:
         if remaining_n == 0:
             basis_keys = tuple(
@@ -1344,7 +1450,25 @@ class FeedForwardBlock(MerlinModule):
         if branch_amplitudes.shape[-1] != expected_dim:
             basis_keys = tuple(layer.computation_process.simulation_graph.mapped_keys)
             return branch_amplitudes, basis_keys
-        output = layer(branch_amplitudes)
+        input_prefixes = list(getattr(layer, "input_parameters", []))
+        classical_features = self._classical_features_for_prefixes(x, input_prefixes)
+        if classical_features is None:
+            output = layer(branch_amplitudes)
+        else:
+            amplitude_input = layer._embed_amplitude_tensor(
+                layer._validate_amplitude_input(branch_amplitudes)
+            )
+            original_input_state = getattr(layer, "input_state", None)
+            original_process_input_state = getattr(
+                layer.computation_process, "input_state", None
+            )
+            layer.input_state = amplitude_input
+            layer.computation_process.input_state = amplitude_input
+            try:
+                output = layer(classical_features)
+            finally:
+                layer.input_state = original_input_state
+                layer.computation_process.input_state = original_process_input_state
         basis_keys = tuple(layer.computation_process.simulation_graph.mapped_keys)
         return output, basis_keys
 
@@ -1596,18 +1720,27 @@ class FeedForwardBlock(MerlinModule):
             empty = torch.zeros(0, device=self.device)
             return empty, []
 
-        aligned: list[torch.Tensor] = []
-        reference_shape: torch.Size | None = None
+        normalized: list[torch.Tensor] = []
         for tensor in flat_tensors:
             if tensor.ndim == 0:
                 tensor = tensor.unsqueeze(0)
-            if reference_shape is None:
-                reference_shape = tensor.shape
-            elif tensor.shape != reference_shape:
+            normalized.append(tensor)
+
+        reference_shape = normalized[0].shape
+        for tensor in normalized[1:]:
+            try:
+                reference_shape = torch.broadcast_shapes(reference_shape, tensor.shape)
+            except RuntimeError as exc:
                 raise RuntimeError(
                     "Inconsistent probability tensor shapes across measurement keys."
-                )
-            aligned.append(tensor)
+                ) from exc
+
+        aligned: list[torch.Tensor] = []
+        for tensor in normalized:
+            if tensor.shape == reference_shape:
+                aligned.append(tensor)
+            else:
+                aligned.append(tensor.expand(reference_shape))
 
         stacked = torch.stack(aligned, dim=1)
         return stacked, flat_keys
@@ -1621,6 +1754,7 @@ class FeedForwardBlock(MerlinModule):
             layer = QuantumLayer(
                 input_size=0,
                 circuit=pcvl.Circuit(n_modes),
+                input_state=self._dummy_fock_input_state(n_modes, n_photons),
                 n_photons=n_photons,
                 device=self.device,
                 dtype=self.dtype,

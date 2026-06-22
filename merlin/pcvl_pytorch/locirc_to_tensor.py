@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import warnings
+from typing import Any
 
 import torch
 from multipledispatch import dispatch
@@ -515,6 +516,215 @@ class CircuitConverter:
         # Remove None entries from the list
         return [item for item in list_rct if item[1] is not None]
 
+    def _component_parameter_value(self, parameter: object) -> torch.Tensor:
+        """Return the torch value represented by a Perceval parameter object.
+
+        Parameters
+        ----------
+        parameter : object
+            Perceval ``Parameter`` or ``Expression`` object read from a circuit
+            component.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar or batched tensor containing the parameter value.
+
+        Raises
+        ------
+        KeyError
+            If a symbolic base parameter has no tensor mapping.
+        NotImplementedError
+            If an expression contains a symbolic operation unsupported by the
+            converter.
+        """
+        if getattr(parameter, "is_variable", False):
+            if getattr(parameter, "_is_expression", False):
+                return self._expression_parameter_value(parameter)
+            name = getattr(parameter, "name")
+            return self._mapped_parameter_value(name)
+
+        return torch.tensor(
+            float(parameter), dtype=self.tensor_fdtype, device=self.device
+        )
+
+    def _mapped_parameter_value(self, parameter_name: str) -> torch.Tensor:
+        """Return the tensor backing one mapped Perceval parameter.
+
+        Parameters
+        ----------
+        parameter_name : str
+            Name of the base Perceval parameter.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor slice containing the current value for ``parameter_name``.
+
+        Raises
+        ------
+        KeyError
+            If ``parameter_name`` is not represented by the current input
+            tensors or memristive metadata.
+        """
+        if parameter_name in self.memristive_metadata_name_to_index:
+            index = self.memristive_metadata_name_to_index[parameter_name]
+            return self.memristive_current_state[index]
+
+        if parameter_name not in self.param_mapping:
+            raise KeyError(
+                f"Parameter '{parameter_name}' not covered by any input tensor."
+            )
+
+        tensor_id, idx_in_tensor = self.param_mapping[parameter_name]
+        return self.torch_params[tensor_id][..., idx_in_tensor]
+
+    def _expression_parameter_value(self, expression: object) -> torch.Tensor:
+        """Evaluate a Perceval expression using mapped torch parameters.
+
+        Parameters
+        ----------
+        expression : object
+            Perceval ``Expression`` object.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor obtained by applying the expression's symbolic arithmetic to
+            mapped parameter tensors.
+
+        Raises
+        ------
+        KeyError
+            If an expression references an unmapped base parameter.
+        NotImplementedError
+            If the expression contains unsupported symbolic operations.
+        """
+        parameter_values = {
+            parameter.name: self._mapped_parameter_value(parameter.name)
+            for parameter in getattr(expression, "parameters")
+        }
+        return self._evaluate_symbolic_expression(
+            getattr(expression, "_symbol"),
+            parameter_values,
+        )
+
+    def _evaluate_symbolic_expression(
+        self, expression: Any, parameter_values: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Evaluate a SymPy expression tree with torch operations.
+
+        Parameters
+        ----------
+        expression : Any
+            SymPy node from a Perceval ``Expression``.
+        parameter_values : dict[str, torch.Tensor]
+            Torch values keyed by base Perceval parameter name.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor value for ``expression``.
+
+        Raises
+        ------
+        KeyError
+            If a symbolic name is missing from ``parameter_values``.
+        NotImplementedError
+            If the expression uses an unsupported symbolic operation.
+        """
+        if expression.is_Number:
+            return torch.tensor(
+                float(expression), dtype=self.tensor_fdtype, device=self.device
+            )
+
+        if expression.is_Symbol:
+            parameter_name = str(expression)
+            if parameter_name not in parameter_values:
+                raise KeyError(
+                    f"Expression parameter '{parameter_name}' not covered by any input tensor."
+                )
+            return parameter_values[parameter_name]
+
+        if expression.is_Add:
+            terms = [
+                self._evaluate_symbolic_expression(arg, parameter_values)
+                for arg in expression.args
+            ]
+            result = terms[0]
+            for term in terms[1:]:
+                result = result + term
+            return result
+
+        if expression.is_Mul:
+            factors = [
+                self._evaluate_symbolic_expression(arg, parameter_values)
+                for arg in expression.args
+            ]
+            result = factors[0]
+            for factor in factors[1:]:
+                result = result * factor
+            return result
+
+        if expression.is_Pow:
+            base, exponent = expression.args
+            return self._evaluate_symbolic_expression(
+                base, parameter_values
+            ) ** self._evaluate_symbolic_expression(exponent, parameter_values)
+
+        if expression.is_Function:
+            return self._evaluate_symbolic_function(expression, parameter_values)
+
+        raise NotImplementedError(
+            f"Unsupported Perceval expression operation '{expression.func}'."
+        )
+
+    def _evaluate_symbolic_function(
+        self, expression: Any, parameter_values: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Evaluate supported unary symbolic functions with torch.
+
+        Parameters
+        ----------
+        expression : Any
+            SymPy function node.
+        parameter_values : dict[str, torch.Tensor]
+            Torch values keyed by base Perceval parameter name.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor value for ``expression``.
+
+        Raises
+        ------
+        NotImplementedError
+            If the function name or arity is unsupported.
+        """
+        unary_functions = {
+            "sin": torch.sin,
+            "cos": torch.cos,
+            "tan": torch.tan,
+            "asin": torch.asin,
+            "acos": torch.acos,
+            "atan": torch.atan,
+            "exp": torch.exp,
+            "log": torch.log,
+            "sqrt": torch.sqrt,
+            "Abs": torch.abs,
+        }
+        function = unary_functions.get(expression.func.__name__)
+        if function is None or len(expression.args) != 1:
+            raise NotImplementedError(
+                f"Unsupported Perceval expression function '{expression.func}'."
+            )
+
+        argument = self._evaluate_symbolic_expression(
+            expression.args[0],
+            parameter_values,
+        )
+        return function(argument)
+
     def to_tensor(
         self,
         *input_params: torch.Tensor,
@@ -691,16 +901,10 @@ class CircuitConverter:
         """
         param_values = []
 
-        for _index, param in enumerate(comp.get_parameters(all_params=True)):
-            if param.is_variable:
-                tensor_id, idx_in_tensor = self.param_mapping[param.name]
-                param_values.append(self.torch_params[tensor_id][..., idx_in_tensor])
-            else:
-                param_values.append(
-                    torch.tensor(
-                        float(param), dtype=self.tensor_fdtype, device=self.device
-                    )
-                )
+        for parameter_name in ("theta", "phi_tl", "phi_bl", "phi_tr", "phi_br"):
+            param_values.append(
+                self._component_parameter_value(comp.param(parameter_name))
+            )
 
         cos_theta = torch.cos(param_values[0] / 2)
         sin_theta = torch.sin(param_values[0] / 2)
@@ -801,23 +1005,7 @@ class CircuitConverter:
         Returns:
             Batched 1x1 phase tensor of shape (batch_size, 1, 1) in complex dtype
         """
-        if comp.param("phi").is_variable:
-            param_name = comp.param("phi").name
-            if len(self.memristive_metadata) > 0:
-                if param_name in self.memristive_metadata_name_to_index.keys():
-                    index = self.memristive_metadata_name_to_index[param_name]
-                    phase = self.memristive_current_state[index]
-                else:
-                    tensor_id, idx_in_tensor = self.param_mapping[param_name]
-                    phase = self.torch_params[tensor_id][..., idx_in_tensor]
-            else:
-                tensor_id, idx_in_tensor = self.param_mapping[param_name]
-                phase = self.torch_params[tensor_id][..., idx_in_tensor]
-
-        else:
-            phase = torch.tensor(
-                comp.param("phi")._value, dtype=self.tensor_fdtype, device=self.device
-            )
+        phase = self._component_parameter_value(comp.param("phi"))
 
         if phase.ndim == 0 and self.batch_size > 1:
             phase = phase.expand(self.batch_size)
